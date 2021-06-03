@@ -9,10 +9,11 @@ use futures::{future::FutureExt, select, StreamExt};
 use mio_serial::SerialPortInfo;
 use serialport::{SerialPortType, UsbPortInfo};
 use std::convert::TryFrom;
-use std::io;
 use std::io::Write;
 use std::result::Result as StdResult;
+use std::{io, path::PathBuf};
 use structopt::StructOpt;
+use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio_serial::{DataBits, FlowControl, Parity, StopBits};
 use tokio_util::codec::BytesCodec;
 use wildmatch::WildMatch;
@@ -37,7 +38,7 @@ struct Opt {
     #[structopt(short, long)]
     debug: bool,
 
-    // Turn on local echo
+    // Turn on local echo (echoes in the terminal even if output-file is used)
     #[structopt(short, long)]
     echo: bool,
 
@@ -59,8 +60,16 @@ struct Opt {
     verbose: bool,
 
     /// Exit using Control-Y rather than Control-X
-    #[structopt(short = "y")]
+    #[structopt(short = "y", long)]
     ctrl_y_exit: bool,
+
+    /// Disable Input from the Terminal (read-only from the port)
+    #[structopt(long)]
+    no_input: bool,
+
+    /// Use Raw mode for output
+    #[structopt(short = "r", long)]
+    no_raw_mode: bool,
 
     /// Filter based on Vendor ID (VID)
     #[structopt(long)]
@@ -101,6 +110,14 @@ struct Opt {
     /// Data bits (5, 6, 7, 8)
     #[structopt(long, default_value = "8")]
     databits: usize,
+
+    /// Buffer Size for output writer
+    #[structopt(short = "B", long, default_value = "64")]
+    buf_size: usize,
+
+    /// Output file
+    #[structopt(short, long)]
+    output_file: Option<PathBuf>,
 }
 
 struct DataBitsOpt(DataBits);
@@ -197,9 +214,9 @@ enum Eol {
 impl Eol {
     fn bytes(&self) -> &[u8] {
         match self {
-            Self::Cr => &b"\r"[..],
-            Self::Crlf => &b"\r\n"[..],
-            Self::Lf => &b"\n"[..],
+            Self::Cr => b"\r",
+            Self::Crlf => b"\r\n",
+            Self::Lf => b"\n",
         }
     }
 }
@@ -209,6 +226,8 @@ impl Eol {
 fn exit_char(opt: &Opt) -> char {
     if opt.ctrl_y_exit {
         'y'
+    } else if opt.no_raw_mode {
+        'c'
     } else {
         'x'
     }
@@ -497,13 +516,19 @@ fn handle_key_event(key_event: KeyEvent, opt: &Opt) -> Result<Option<Bytes>> {
 
 // Main function which collects input from the user and sends it over the serial link
 // and collects serial data and presents it to the user.
-async fn monitor(port: &mut tokio_serial::Serial, opt: &Opt) -> Result<()> {
+async fn monitor(
+    port: &mut tokio_serial::Serial,
+    output: impl AsyncWrite + Unpin,
+    opt: &Opt,
+) -> Result<()> {
     let mut reader = EventStream::new();
     let (rx_port, tx_port) = tokio::io::split(port);
 
     let mut serial_reader = tokio_util::codec::FramedRead::new(rx_port, StringDecoder::new());
     let serial_sink = tokio_util::codec::FramedWrite::new(tx_port, BytesCodec::new());
     let (serial_writer, serial_consumer) = futures::channel::mpsc::unbounded::<Bytes>();
+
+    let mut output = BufWriter::with_capacity(opt.buf_size, output);
 
     let exit_code = exit_code(opt);
 
@@ -521,8 +546,10 @@ async fn monitor(port: &mut tokio_serial::Serial, opt: &Opt) -> Result<()> {
                             break;
                         }
                         if let Event::Key(key_event) = event {
-                            if let Some(key) = handle_key_event(key_event, opt)? {
-                                serial_writer.unbounded_send(key).unwrap();
+                            if !opt.no_input {
+                                if let Some(key) = handle_key_event(key_event, opt)? {
+                                    serial_writer.unbounded_send(key).unwrap();
+                                }
                             }
                         } else {
                             println!("Unrecognized Event::{:?}\r", event);
@@ -540,8 +567,9 @@ async fn monitor(port: &mut tokio_serial::Serial, opt: &Opt) -> Result<()> {
                         if opt.debug {
                             println!("Serial Event:{:?}\r", serial_event);
                         } else {
-                            print!("{}", serial_event);
-                            std::io::stdout().flush()?;
+                            output.write_all(serial_event.as_bytes()).await?;
+                            // print!("{}", serial_event);
+                            // std::io::stdout().flush()?;
                         }
                     },
                     Some(Err(e)) => {
@@ -609,9 +637,31 @@ async fn real_main() -> Result<()> {
 
     println!("Connected to {}", port_name);
     println!("Press {} to exit", exit_label(&opt));
-    enable_raw_mode()?;
-    let result = monitor(&mut port, &opt).await;
-    disable_raw_mode()?;
+
+    if !opt.no_raw_mode {
+        enable_raw_mode()?;
+    }
+
+    let result = if let Some(path) = &opt.output_file {
+        let output = tokio::fs::OpenOptions::new()
+            .write(true)
+            .append(true)
+            .create(true)
+            .open(path)
+            .await;
+        match output {
+            Ok(output) => monitor(&mut port, output, &opt).await,
+            Err(e) => Err(e.into()),
+        }
+    } else {
+        let output = tokio::io::stdout();
+        monitor(&mut port, output, &opt).await
+    };
+
+    if !opt.no_raw_mode {
+        disable_raw_mode()?;
+    }
+
     println!();
     result
 }
